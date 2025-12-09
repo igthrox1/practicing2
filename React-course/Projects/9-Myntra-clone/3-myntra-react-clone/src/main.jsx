@@ -1,4 +1,3 @@
-import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './routes/App.jsx'
@@ -7,6 +6,7 @@ import Bag from './routes/bag.jsx';
 import Home from './routes/home.jsx';
 import { Provider } from 'react-redux';
 import MyntraStore from './store/index.js';
+import "bootstrap/dist/css/bootstrap.min.css";
 
 const Router = createBrowserRouter([
   {
