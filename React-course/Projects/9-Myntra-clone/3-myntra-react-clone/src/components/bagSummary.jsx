@@ -9,7 +9,7 @@ function BagSummary() {
   });
 
   let totalItem = bagItemsIds.length;
-  let CONVENIENCE_FEES = 99;
+  let CONVENIENCE_FEES = 0;
   let totalMRP = 0;
   let totalDiscount = 0;
 
