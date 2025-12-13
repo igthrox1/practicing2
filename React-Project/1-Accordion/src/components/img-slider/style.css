@@ -1,0 +1,13 @@
+.Container {
+    position:relative;
+    display:flex;
+    justify-content: center;
+    align-items:center;
+    width:600px;
+    height:450px;
+}
+
+.current-image{
+    border-radius: 0.5rem;
+    box-shadow: 0px 0px  7px #666;
+}
