@@ -2,12 +2,12 @@ import { useEffect } from "react";
 import { useState } from "react";
 import { FaArrowRight } from "react-icons/fa";
 import { FaArrowLeft } from "react-icons/fa";
-import "./style.css"
+import "./style.css";
 
 function ImageSlider({ url, limit }) {
   const [images, setImages] = useState([]);
   const [currentSlide, setCurrentSlide] = useState(0);
-  const [errorMsg, setErrorMsg] = useState('');
+  const [errorMsg, setErrorMsg] = useState("");
   const [loadingState, setLoadingState] = useState(false);
 
   async function fetchImages(getUrl) {
@@ -24,7 +24,6 @@ function ImageSlider({ url, limit }) {
       setErrorMsg(e.message);
     }
   }
-  console.log(images);
 
   useEffect(() => {
     if (url !== "") fetchImages(url);
@@ -38,28 +37,46 @@ function ImageSlider({ url, limit }) {
     return <div>Error occured {errorMsg} </div>;
   }
 
+  function handlePrevious() {
+    setCurrentSlide(currentSlide === 0 ? images.length - 1 : currentSlide - 1);
+  }
+
+  function handleNext() {
+    setCurrentSlide(currentSlide === images.length - 1 ? 0 : currentSlide + 1);
+  }
+
   return (
     <div className="Container">
-      <FaArrowRight className="arrow arrow-left" />
+      <FaArrowLeft onClick={handlePrevious} className="arrow arrow-left" />
       {images && images.length
-        ? images.map((imageItem) => (
+        ? images.map((imageItem, index) => (
             <img
               key={imageItem.id}
               alt={imageItem.download_url}
               src={imageItem.download_url}
-              className="current-image"
+              className={
+                currentSlide === index
+                  ? "current-image"
+                  : " current-image hide-current-image"
+              }
             />
           ))
         : null}
-      <FaArrowLeft className="arrow arrow-Right" />
+      <FaArrowRight onClick={handleNext} className="arrow arrow-Right" />
       <span className="circle-indicators">
-          {
-            images && images.length ? 
-            images.map((_,index)=><button 
-            key={index}
-            className="current-indicator" />)
-            :null
-          }
+        {images && images.length
+          ? images.map((_, index) => (
+              <button
+                key={index}
+                className={
+                  currentSlide === index
+                    ? "current-indicator"
+                    : " current-indicator inactive-indicator"
+                }
+                onClick={()=> {setCurrentSlide(index)}}
+              />
+            ))
+          : null}
       </span>
     </div>
   );
