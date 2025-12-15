@@ -38,7 +38,7 @@ function RandomColor() {
         }}
       >
         <div className="btns">
-          <button className="btn" onClick={() => setTypeOf("rgb")}>
+          <button className="btn" onClick={() => setTypeOf("rgb")} >
             {" "}
             Create RGB button{" "}
           </button>
