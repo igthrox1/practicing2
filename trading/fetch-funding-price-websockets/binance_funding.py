@@ -2,7 +2,7 @@ import asyncio
 import websockets
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import  timedelta
 
 # Binance mark price + funding rate WebSocket
 URL = "wss://fstream.binance.com/ws/btcusdt@markPrice"
@@ -12,13 +12,10 @@ async def main():
         print("Connected to Binance live funding + mark price feed")
         while True:
             try:
-                start_time = time.time()
                 msg = await ws.recv()
-                receive_time = time.time()
-                
                 data = json.loads(msg)
                 # Mark price
-                mark_price = data.get("p")  # string, exact
+                #mark_price = data.get("p")  # string, exact
                 # Funding rate (raw, full precision)
                 funding_rate = data.get("r")  # string
                 # Next funding timestamp
@@ -32,13 +29,13 @@ async def main():
                 minutes, seconds = divmod(remainder, 60)
                 time_left_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
                 # Latency in ms
-                latency_ms = (receive_time - start_time) * 1000
+                #latency_ms = (receive_time - start_time) * 1000
 
                 print(
-                    f"BTCUSDT Mark Price: {mark_price} | "
+                    #f"BTCUSDT Mark Price: {mark_price} | "
                     f"Funding Rate: {funding_rate} | "
                     f"Time Left: {time_left_str} | "
-                    f"Latency: {latency_ms:.2f} ms"
+                    #f"Latency: {latency_ms:.2f} ms"
                 )
 
             except (json.JSONDecodeError, KeyError, ValueError):
@@ -49,6 +46,7 @@ async def main():
             except Exception as e:
                 print("Error:", e)
                 await asyncio.sleep(5)
+            except KeyboardInterrupt:
+                print("Succesfully Exited the program")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
