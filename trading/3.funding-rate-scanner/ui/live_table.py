@@ -18,7 +18,7 @@ def make_table(state: dict) -> Table:
 
         # Safe rate formatting
         try:
-            rate_str = f"{float(rate):.6f}" if rate is not None else "-"
+            rate_str = f"{float(rate)*100:.6f}%" if rate is not None else "-"
         except (ValueError, TypeError):
             rate_str = "-"
 
