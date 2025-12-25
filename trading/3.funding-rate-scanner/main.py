@@ -55,8 +55,6 @@ async def main():
             # ✅ Do not print anything if signals are unchanged
             await asyncio.sleep(1)
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nProgram stopped cleanly")
+
+asyncio.run(main())
+    
