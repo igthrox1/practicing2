@@ -1,19 +1,24 @@
-import asyncio, websockets, json
+from pybit.unified_trading import HTTP
 
-URL = "wss://fstream.binance.com/ws/{}@markPrice"
+KEY = "hfE8R6aHfeEdGX18w7"
+SECRET = "AYuExy9gfspxpTBWTZkyHIiyKz8vkdqVqnso"
 
-async def fetch_binance(btcusdt):
-    while True:
-        try:
-            async with websockets.connect(URL.format(btcusdt.lower())) as ws:
-                print("✅ Binance WS connected")
-                while True:
-                    msg = json.loads(await ws.recv())
-                    funding_rate = float(msg.get("r", 0))
-                    next_settlement = int(msg.get("T", 0)) / 1000
-                    mark_price= float(msg["p"])
-                    print(f"Binance | Funding Rate: {funding_rate} | Next Settlement: {next_settlement} | Mark Price: {mark_price}")
-        except Exception as e:
-            print("Binance WS error:", e)
-            await asyncio.sleep(2)
-asyncio.run(fetch_binance('btcusdt'))
+session = HTTP(demo=True, api_key=KEY, api_secret=SECRET)
+
+# Try different endpoints
+tests = [
+    ("Balance", session.get_wallet_balance, {"accountType": "UNIFIED"}),
+    ("Position", session.get_positions, {"category": "linear", "symbol": "BTCUSDT"}),
+    ("Symbol Info", session.get_instruments_info, {"category": "linear", "symbol": "BTCUSDT"}),
+]
+
+for name, func, params in tests:
+    print(f"\n📊 Testing {name}...")
+    try:
+        result = func(**params)
+        if result['retCode'] == 0:
+            print(f"✅ {name}: OK")
+        else:
+            print(f"❌ {name}: {result['retMsg']}")
+    except Exception as e:
+        print(f"❌ {name}: Error - {e}")
