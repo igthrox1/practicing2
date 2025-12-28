@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import requests
 from urllib.parse import urlencode
+from decimal import Decimal, ROUND_DOWN
 
 # =========================
 # BINANCE WS (MARK + FUNDING)
@@ -141,29 +142,42 @@ def binance_set_leverage(symbol, lev):
         print(f"Binance leverage error: {e}")
         return {}
 
-def get_binance_precision(coin):
-    """Get quantity precision for Binance based on coin"""
-    # For BEAUT on testnet, use 0 decimal places (integer)
-    if coin == "BEAUT" or coin == "BEAT":
-        return 0  # No decimals, integer only
-    precision_map = {
-        "BTC": 3,  # 0.001
-        "ETH": 2,  # 0.01
-        "SOL": 1,  # 0.1
-    }
-    return precision_map.get(coin, 0)  # default 0 decimals for testnet coins
-
-def binance_order(symbol, side, qty, coin):
+def get_binance_symbol_filters(symbol):
+    """Fetch LOT_SIZE stepSize from Binance API"""
     try:
-        # Get proper precision for the coin
-        precision = get_binance_precision(coin)
-        qty = round(qty, precision)
+        url = BINANCE_URL + "/fapi/v1/exchangeInfo"
+        r = requests.get(url, timeout=5)
+        data = r.json()
         
-        # For 0 precision (integers), convert to int
-        if precision == 0:
-            qty = int(qty)
+        for s in data.get("symbols", []):
+            if s["symbol"] == symbol:
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        return f["stepSize"]
+        return "1"  # Default fallback
+    except Exception as e:
+        print(f"Error fetching Binance filters: {e}")
+        return "1"
+
+def round_step_size(quantity, step_size):
+    """Round quantity to match stepSize precision"""
+    step_size = Decimal(str(step_size))
+    quantity = Decimal(str(quantity))
+    precision = step_size.normalize().as_tuple().exponent
+    if precision < 0:
+        precision = abs(precision)
+    else:
+        precision = 0
+    
+    # Round down to avoid exceeding balance
+    rounded = float(quantity.quantize(Decimal(str(step_size)), rounding=ROUND_DOWN))
+    return rounded
+
+def binance_order(symbol, side, qty, step_size):
+    try:
+        qty = round_step_size(qty, step_size)
         
-        print(f"Binance order - Symbol: {symbol}, Side: {side}, Qty: {qty}, Precision: {precision}")
+        print(f"Binance order - Symbol: {symbol}, Side: {side}, Qty: {qty}, StepSize: {step_size}")
         
         params = binance_sign({
             "symbol": symbol,
@@ -185,22 +199,16 @@ def binance_order(symbol, side, qty, coin):
         return {}
 
 # =========================
-# BYBIT TESTNET EXECUTION
+# BYBIT DEMO EXECUTION (CHANGED FROM TESTNET)
 # =========================
-# REPLACE THESE WITH YOUR NEW BYBIT TESTNET KEYS!
-# Go to: https://testnet.bybit.com → API Management
-BYBIT_KEY = "R5OreWyzfJFbaOU1Hs"  # ← REPLACE THIS!
-BYBIT_SECRET = "5edaVROUGbHKCb81nmTHsPjdu2F9XODmNiNZ"  # ← REPLACE THIS!
-BYBIT_URL = "https://api-testnet.bybit.com"
+BYBIT_KEY = "hfE8R6aHfeEdGX18w7"
+BYBIT_SECRET = "AYuExy9gfspxpTBWTZkyHIiyKz8vkdqVqnso"
+BYBIT_URL = "https://api-demo.bybit.com"  # ✅ CHANGED TO DEMO
 
 def bybit_sign(params, timestamp):
-    # Correct signature for V5 API
-    import urllib.parse
     if params:
-        # For POST requests
         param_str = timestamp + BYBIT_KEY + "5000" + json.dumps(params)
     else:
-        # For GET requests
         param_str = timestamp + BYBIT_KEY + "5000"
     
     signature = hmac.new(
@@ -214,7 +222,6 @@ def bybit_set_leverage(symbol, lev):
     try:
         timestamp = str(int(time.time() * 1000))
         
-        # Check API keys first
         signature = bybit_sign({}, timestamp)
         
         headers = {
@@ -224,7 +231,6 @@ def bybit_set_leverage(symbol, lev):
             "X-BAPI-RECV-WINDOW": "5000",
         }
         
-        # Check if API key is valid
         r = requests.get(
             BYBIT_URL + "/v5/account/info",
             headers=headers,
@@ -234,9 +240,8 @@ def bybit_set_leverage(symbol, lev):
         if r.status_code == 200:
             response = r.json()
             if response.get("retCode") == 0:
-                print("✅ Bybit API keys are valid")
+                print("✅ Bybit Demo API keys are valid")
                 
-                # Set leverage
                 params = {
                     "category": "linear",
                     "symbol": symbol,
@@ -257,7 +262,7 @@ def bybit_set_leverage(symbol, lev):
                 print(f"Bybit leverage response: {r.status_code} - {r.text}")
             else:
                 print(f"❌ Bybit API error: {response.get('retMsg', 'Unknown error')}")
-                print("⚠️ Get new API keys from: https://testnet.bybit.com")
+                print("⚠️ Get new Demo API keys from: https://www.bybit.com (Demo Trading)")
         else:
             print(f"❌ Bybit API connection failed: {r.status_code}")
             
@@ -266,15 +271,26 @@ def bybit_set_leverage(symbol, lev):
         print(f"Bybit leverage error: {e}")
         return {}
 
-def bybit_order(symbol, side, qty, coin):
+def get_bybit_symbol_filters(symbol):
+    """Fetch Bybit instrument info for qty step"""
     try:
-        # For BEAUT/BEAT on testnet, use integer quantity
-        if coin == "BEAUT" or coin == "BEAT":
-            qty = int(round(qty, 0))
-        else:
-            precision_map = {"BTC": 3, "ETH": 2, "SOL": 1}
-            precision = precision_map.get(coin, 0)
-            qty = round(qty, precision)
+        url = BYBIT_URL + f"/v5/market/instruments-info?category=linear&symbol={symbol}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        
+        if data.get("retCode") == 0:
+            result = data.get("result", {}).get("list", [])
+            if result:
+                lot_size_filter = result[0].get("lotSizeFilter", {})
+                return lot_size_filter.get("qtyStep", "1")
+        return "1"
+    except Exception as e:
+        print(f"Error fetching Bybit filters: {e}")
+        return "1"
+
+def bybit_order(symbol, side, qty, step_size):
+    try:
+        qty = round_step_size(qty, step_size)
         
         timestamp = str(int(time.time() * 1000))
         
@@ -297,7 +313,7 @@ def bybit_order(symbol, side, qty, coin):
             "Content-Type": "application/json"
         }
         
-        print(f"Bybit order - Symbol: {symbol}, Side: {side}, Qty: {qty}")
+        print(f"Bybit order - Symbol: {symbol}, Side: {side}, Qty: {qty}, StepSize: {step_size}")
         
         r = requests.post(
             BYBIT_URL + "/v5/order/create",
@@ -321,16 +337,13 @@ def should_execute(ts, target_time_str):
     
     current_time_left = time_left(ts)
     
-    # Parse target time HH:MM:SS
     try:
         target_h, target_m, target_s = map(int, target_time_str.split(':'))
         target_seconds = target_h * 3600 + target_m * 60 + target_s
         
-        # Parse current time left
         current_h, current_m, current_s = map(int, current_time_left.split(':'))
         current_seconds = current_h * 3600 + current_m * 60 + current_s
         
-        # Check if we're within 1 second of target time
         return abs(current_seconds - target_seconds) <= 1
     except:
         return False
@@ -366,13 +379,19 @@ async def main():
         print(f"\n⏰ Waiting for execution time: {EXECUTION_TIME} before funding")
         print("📊 Monitoring funding rates...")
         
+        # Fetch symbol filters once at start
+        binance_symbol = coin + "USDT"
+        bybit_symbol = coin + "USDT"
+        binance_step = get_binance_symbol_filters(binance_symbol)
+        bybit_step = get_bybit_symbol_filters(bybit_symbol)
+        
+        print(f"📏 Binance stepSize: {binance_step}, Bybit qtyStep: {bybit_step}")
+        
         while True:
-            # Check if we have data from both exchanges
             if "binance" in exchanges and "bybit" in exchanges:
                 if (state["binance"]["next_ts"] and state["bybit"]["next_ts"] and
                     not trade_fired):
                     
-                    # Get the signal
                     sig = funding_arbitrage_signal(state, exchanges, MIN_SPREAD)
                     
                     if sig:
@@ -380,7 +399,6 @@ async def main():
                               f"Short {sig['short']} ({state[sig['short']]['funding']:.4f}%), "
                               f"Spread: {sig['spread']:.4f}%")
                     
-                    # Check execution time
                     exchange_to_check = "binance" if "binance" in exchanges else "bybit"
                     
                     if should_execute(state[exchange_to_check]["next_ts"], EXECUTION_TIME):
@@ -388,37 +406,29 @@ async def main():
                             print(f"\n🚀 EXECUTING HEDGE at {time_left(state[exchange_to_check]['next_ts'])}")
                             print(f"Strategy: Long {sig['long']}, Short {sig['short']}")
                             
-                            # Set leverage on both exchanges
-                            binance_set_leverage(coin + "USDT", leverage)
-                            bybit_set_leverage(coin + "USDT", leverage)
+                            binance_set_leverage(binance_symbol, leverage)
+                            bybit_set_leverage(bybit_symbol, leverage)
                             
-                            # Calculate quantities with INTEGER precision for BEAUT
-                            if coin == "BEAUT" or coin == "BEAT":
-                                # For testnet BEAUT, use integer quantities only
-                                qty_b = int(round((usdt * leverage) / state["binance"]["price"], 0))
-                                qty_y = int(round((usdt * leverage) / state["bybit"]["price"], 0))
-                                precision = 0
-                            else:
-                                precision = get_binance_precision(coin)
-                                qty_b = round((usdt * leverage) / state["binance"]["price"], precision)
-                                qty_y = round((usdt * leverage) / state["bybit"]["price"], precision)
+                            # Calculate raw quantities
+                            qty_b = (usdt * leverage) / state["binance"]["price"]
+                            qty_y = (usdt * leverage) / state["bybit"]["price"]
                             
-                            print(f"Quantities: Binance={qty_b} (precision={precision}), Bybit={qty_y}")
+                            print(f"Raw Quantities: Binance={qty_b}, Bybit={qty_y}")
                             
-                            # Place orders
+                            # Place orders with proper rounding
                             if sig["long"] == "binance":
-                                print(f"Placing Binance BUY order for {qty_b} {coin}...")
-                                binance_order(coin + "USDT", "BUY", qty_b, coin)
+                                print(f"Placing Binance BUY order...")
+                                binance_order(binance_symbol, "BUY", qty_b, binance_step)
                             else:
-                                print(f"Placing Binance SELL order for {qty_b} {coin}...")
-                                binance_order(coin + "USDT", "SELL", qty_b, coin)
+                                print(f"Placing Binance SELL order...")
+                                binance_order(binance_symbol, "SELL", qty_b, binance_step)
                             
                             if sig["long"] == "bybit":
-                                print(f"Placing Bybit Buy order for {qty_y} {coin}...")
-                                bybit_order(coin + "USDT", "Buy", qty_y, coin)
+                                print(f"Placing Bybit Buy order...")
+                                bybit_order(bybit_symbol, "Buy", qty_y, bybit_step)
                             else:
-                                print(f"Placing Bybit Sell order for {qty_y} {coin}...")
-                                bybit_order(coin + "USDT", "Sell", qty_y, coin)
+                                print(f"Placing Bybit Sell order...")
+                                bybit_order(bybit_symbol, "Sell", qty_y, bybit_step)
                             
                             trade_fired = True
                             print("✅ Orders placed! Waiting for next funding period...")
