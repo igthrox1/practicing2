@@ -1,0 +1,6 @@
+to run humming bot
+# Pull the Hummingbot image
+docker pull hummingbot/hummingbot:latest
+
+# Run Hummingbot
+docker run -it --name hummingbot hummingbot/hummingbot:latest
