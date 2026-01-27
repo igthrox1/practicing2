@@ -8,7 +8,7 @@ import menus from "./components/tree-view/data"
 import QRCodeGenerator from "./components/qr-code-generator"
 import LightDarkMode from "./components/light-dark-mode"
 import ScrollIndicator from "./components/scroll-indicator"
-
+import OrderBookDisplay from "./components/bid-ask/bid-ask"
 function App() {
   
 
@@ -23,6 +23,7 @@ function App() {
       <QRCodeGenerator/>
       <LightDarkMode/>
       <ScrollIndicator url = {'https://dummyjson.com/products'} />
+      <OrderBookDisplay/>
     </>
   )
 }
