@@ -151,6 +151,31 @@ def get_bybit_server_time():
     except Exception as e:
         print(f"❌ Failed to sync with Bybit: {e}")
         return False
+
+def continuous_time_sync(state, exchanges):
+    """Re-sync time with exchange servers every 2 minutes"""
+    global TIME_OFFSET, MANUAL_ADJUST
+    
+    while state.get("running", True):
+        try:
+            # Alternate between exchanges for redundancy
+            if "binance" in exchanges:
+                success = get_binance_server_time()
+                if success:
+                    audit_log("🔄 Time re-synced with Binance")
+            elif "bybit" in exchanges:
+                success = get_bybit_server_time()
+                if success:
+                    audit_log("🔄 Time re-synced with Bybit")
+            
+            # Wait 2 minutes before next sync
+            time.sleep(120)
+            
+        except Exception as e:
+            audit_log(f"⚠️ Time sync error: {e}")
+            time.sleep(120)  # Still wait 2 min even on error
+
+
 # =========================
 # BINANCE WS (MARK + FUNDING)
 # =========================
@@ -810,6 +835,10 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
         # 🆕 CHECK IF OTHER SIDE FINISHED FIRST
         # 🆕 CHECK IF OTHER SIDE FINISHED FIRST
         other_exchange = "bybit" if exchange == "binance" else "binance"
+        if shared_fill_state[exchange]["done"]:
+            audit_log(f"{exchange.upper()} ✅ Already done, exiting chaser")
+            break
+
         if shared_fill_state[other_exchange]["done"] and not shared_fill_state[exchange]["done"]:
     
             # 🎯 LOCK the target USDT value once (first time we see it)
@@ -1003,7 +1032,8 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
                 continue
             
             # ✅ ULTRA-AGGRESSIVE: Cancel if price moves by more than 1 tick
-            if abs(status["price"] - target_price) >= float(tick_size):
+            # 🆕 FIX: Only cancel if other exchange is still active (not done)
+            if not shared_fill_state[other_exchange]["done"] and abs(status["price"] - target_price) >= float(tick_size):
                 audit_log(f"{exchange.upper()} 🔄 PRICE MOVED >= TICK! {status['price']:.8f} → {target_price:.8f} | CANCELING!")
                 
                 # Cancel order
@@ -1157,6 +1187,486 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
 
     return total_filled, total_value
 
+async def limit_order_exit_chaser_v3(exchange, symbol, side, state, filters, trade_records, position_info, shared_exit_state):
+    """
+    Exit chaser V3: When ANY exchange's BBO changes, BOTH cancel and recalculate together
+    """
+    step_size = filters["step_size"]
+    tick_size = filters["tick_size"]
+    min_notional = float(filters["min_notional"])
+    
+    entry_price = position_info[exchange]["entry_price"]
+    total_qty = position_info[exchange]["size"]
+    position_side = position_info[exchange]["side"]
+    
+    audit_log(f"{'='*80}")
+    audit_log(f"🚪 EXIT CHASER V3 INITIALIZED: {exchange.upper()}")
+    audit_log(f"   Position: {position_side} {total_qty} @ ${entry_price:.8f}")
+    audit_log(f"{'='*80}")
+    
+    remaining_qty = total_qty
+    realized_pnl = 0.0
+    realized_filled = 0.0
+    realized_value = 0.0
+    active_order_id = None
+    iteration = 0
+    float_step = float(step_size)
+    
+    # 🆕 CUMULATIVE TRACKING ACROSS ALL ORDERS
+    cumulative_filled_qty = 0.0
+    cumulative_filled_value = 0.0
+    cumulative_realized_pnl = 0.0
+    
+    # Track locked price for this exchange
+    locked_price = None
+    
+    # OUTER LOOP: Keep trying until position is empty
+    while remaining_qty >= float_step:
+        iteration += 1
+        
+        # ====================================
+        # STEP 1: Wait for BOTH exchanges to be ready
+        # ====================================
+        # Set my status as "ready to calculate"
+        shared_exit_state[exchange]["status"] = "calculating"
+        
+        # Wait for other exchange to also be ready
+        other_exchange = "bybit" if exchange == "binance" else "binance"
+        while shared_exit_state[other_exchange]["status"] not in ["calculating", "done"]:
+            await asyncio.sleep(0.01)
+        
+        # If other exchange is done, I can proceed freely
+        if shared_exit_state[other_exchange]["status"] == "done":
+            pass  # No coordination needed
+        
+        # ====================================
+        # STEP 2: Get current Best BID/ASK
+        # ====================================
+        if side.upper() in ["SELL", "Sell"]:
+            current_best_price = state[exchange]["ask"]
+        else:
+            current_best_price = state[exchange]["bid"]
+        
+        if current_best_price <= 0:
+            await asyncio.sleep(0.05)
+            continue
+        
+        # ====================================
+        # STEP 3: Calculate THIS exchange's PNL (Realized + Unrealized)
+        # ====================================
+        # 🆕 Use cumulative values for accurate tracking
+        remaining_qty = total_qty - cumulative_filled_qty
+        
+        if position_side in ["LONG", "Buy"]:
+            unrealized_pnl = (current_best_price - entry_price) * remaining_qty
+        else:
+            unrealized_pnl = (entry_price - current_best_price) * remaining_qty
+        
+        my_total_pnl = cumulative_realized_pnl + unrealized_pnl
+        
+        # 🆕 Enhanced logging every 50 iterations
+        if iteration % 50 == 0:
+            side_str = "BID" if side.upper() in ["BUY", "Buy"] else "ASK"
+            audit_log(f"{exchange.upper()} 📊 EXIT TRACKING:")
+            audit_log(f"   Filled: {cumulative_filled_qty:.1f}/{total_qty} coins (${cumulative_filled_value:.2f})")
+            audit_log(f"   Realized PNL: ${cumulative_realized_pnl:+.6f}")
+            audit_log(f"   Remaining: {remaining_qty:.1f} coins @ Entry ${entry_price:.8f}")
+            audit_log(f"   Current {side_str}: ${current_best_price:.8f}")
+            audit_log(f"   Unrealized PNL: ${unrealized_pnl:+.6f}")
+            audit_log(f"   TOTAL PNL: ${my_total_pnl:+.6f}")
+        
+        # Update shared state with cumulative values
+        shared_exit_state[exchange]["realized_pnl"] = cumulative_realized_pnl
+        shared_exit_state[exchange]["unrealized_pnl"] = unrealized_pnl
+        shared_exit_state[exchange]["total_pnl"] = my_total_pnl
+        shared_exit_state[exchange]["remaining_qty"] = remaining_qty
+        shared_exit_state[exchange]["best_price"] = current_best_price
+        shared_exit_state[exchange]["filled_qty"] = cumulative_filled_qty
+        
+        # ====================================
+        # STEP 4: Wait for OTHER exchange to finish calculating
+        # ====================================
+        # Brief wait for other exchange to update their shared state
+        await asyncio.sleep(0.02)
+        
+        # ====================================
+        # STEP 5: Check COMBINED PNL from BOTH exchanges
+        # ====================================
+        other_pnl = shared_exit_state[other_exchange]["total_pnl"]
+        other_realized = shared_exit_state[other_exchange]["realized_pnl"]
+        other_unrealized = shared_exit_state[other_exchange]["unrealized_pnl"]
+        combined_pnl = my_total_pnl + other_pnl
+        
+        if iteration % 50 == 0:
+            # 🆕 DETAILED BREAKDOWN LOGGING
+            audit_log(f"{'='*90}")
+            audit_log(f"📊 COMBINED PNL CHECK - Iteration #{iteration}")
+            audit_log(f"")
+            audit_log(f"   {exchange.upper():7} | Realized: ${cumulative_realized_pnl:+.6f} + Unrealized: ${unrealized_pnl:+.6f} = ${my_total_pnl:+.6f}")
+            audit_log(f"   {other_exchange.upper():7} | Realized: ${other_realized:+.6f} + Unrealized: ${other_unrealized:+.6f} = ${other_pnl:+.6f}")
+            audit_log(f"")
+            
+            # Color coding for combined PNL
+            if combined_pnl >= 0:
+                audit_log(f"   ✅ COMBINED: ${cumulative_realized_pnl:+.6f} + ${unrealized_pnl:+.6f} + ${other_realized:+.6f} + ${other_unrealized:+.6f} = ${combined_pnl:+.6f}")
+            else:
+                audit_log(f"   ❌ COMBINED: ${cumulative_realized_pnl:+.6f} + ${unrealized_pnl:+.6f} + ${other_realized:+.6f} + ${other_unrealized:+.6f} = ${combined_pnl:+.6f}")
+            
+            audit_log(f"{'='*90}")
+        
+        # ====================================
+        # STEP 6: If COMBINED PNL < 0, WAIT (cancel any active order)
+        # ====================================
+        if combined_pnl < 0:
+            if active_order_id:
+                audit_log(f"{exchange.upper()} ❌ COMBINED PNL NEGATIVE (${combined_pnl:.6f}) - Canceling order")
+                
+                if exchange == "binance":
+                    binance_cancel_order(symbol, active_order_id)
+                else:
+                    bybit_cancel_order(symbol, active_order_id)
+                
+                await asyncio.sleep(0.1)
+                
+                # 🆕 After cancel, update cumulative fills
+                if exchange == "binance":
+                    res = binance_get_order(symbol, active_order_id)
+                    if res and "orderId" in res:
+                        this_order_filled = float(res.get("executedQty", 0))
+                        this_order_value = float(res.get("cumQuote", 0))
+                else:
+                    res = bybit_get_order(symbol, active_order_id)
+                    result_list = res.get("result", {}).get("list", [])
+                    if result_list:
+                        this_order_filled = float(result_list[0].get("cumExecQty", 0))
+                        this_order_value = float(result_list[0].get("cumExecValue", 0))
+                
+                # Only count fills we haven't already counted
+                new_fills = this_order_filled - (cumulative_filled_qty - realized_filled)
+                new_value = this_order_value - (cumulative_filled_value - realized_value)
+                
+                if new_fills > 0:
+                    avg_price = new_value / new_fills
+                    if position_side in ["LONG", "Buy"]:
+                        new_pnl = (avg_price - entry_price) * new_fills
+                    else:
+                        new_pnl = (entry_price - avg_price) * new_fills
+                    
+                    cumulative_realized_pnl += new_pnl
+                    cumulative_filled_qty += new_fills
+                    cumulative_filled_value += new_value
+                    
+                    audit_log(f"{exchange.upper()} 💰 Post-Cancel Fill: +{new_fills} @ ${avg_price:.8f} | PNL: ${new_pnl:+.6f}")
+                
+                # Update tracking
+                realized_filled = cumulative_filled_qty
+                realized_value = cumulative_filled_value
+                realized_pnl = cumulative_realized_pnl
+                remaining_qty = total_qty - cumulative_filled_qty
+                active_order_id = None
+                locked_price = None
+            
+            shared_exit_state[exchange]["status"] = "waiting_pnl"
+            await asyncio.sleep(0.05)
+            continue
+        
+        # ====================================
+        # STEP 7: COMBINED PNL >= 0, Lock price and place order
+        # ====================================
+        snapshot_price = current_best_price
+        
+        # Check if we need to place a new order
+        if not active_order_id:
+            # Check minimum notional
+            qty_to_order = remaining_qty
+            order_value = qty_to_order * snapshot_price
+            
+            if order_value < min_notional:
+                min_qty_needed = math.ceil(min_notional / snapshot_price)
+                min_qty_needed = round_step_size(min_qty_needed, step_size)
+                
+                if min_qty_needed <= remaining_qty:
+                    qty_to_order = min_qty_needed
+                else:
+                    audit_log(f"{exchange.upper()} 💎 Accepting dust (${remaining_qty * snapshot_price:.2f})")
+                    break
+            
+            if qty_to_order <= 0:
+                break
+            
+            audit_log(f"{exchange.upper()} 📤 PLACING: {side} {qty_to_order} @ ${snapshot_price:.8f}")
+            
+            res = {}
+            if exchange == "binance":
+                res = binance_limit_order(symbol, side, qty_to_order, snapshot_price, step_size, tick_size)
+                active_order_id = res.get("orderId")
+            else:
+                res = bybit_limit_order(symbol, side, qty_to_order, snapshot_price, step_size, tick_size)
+                active_order_id = res.get("result", {}).get("orderId")
+            
+            if active_order_id:
+                trade_records[exchange]["exit_order_ids"].append(active_order_id)
+                locked_price = snapshot_price
+                shared_exit_state[exchange]["locked_price"] = locked_price
+                shared_exit_state[exchange]["status"] = "order_active"
+                audit_log(f"{exchange.upper()} ✅ Order placed: ID={active_order_id} @ ${locked_price:.8f}")
+            else:
+                if exchange == "binance" and res.get("code") == -4164 and res.get("is_min_notional"):
+                    audit_log(f"{exchange.upper()} 💎 Dust accepted")
+                    break
+                await asyncio.sleep(0.2)
+                continue
+        
+        # ====================================
+        # STEP 8: Monitor fills and BBO changes (BOTH EXCHANGES!)
+        # ====================================
+        shared_exit_state[exchange]["status"] = "monitoring"
+        
+        while active_order_id:
+            await asyncio.sleep(0.02)  # 20ms checks
+            
+            # Check order status
+            status = None
+            if exchange == "binance":
+                res = binance_get_order(symbol, active_order_id)
+                if res and "orderId" in res:
+                    status = {
+                        "filled": float(res.get("executedQty", 0)),
+                        "value": float(res.get("cumQuote", 0)),
+                        "status": res.get("status", "UNKNOWN")
+                    }
+            else:
+                res = bybit_get_order(symbol, active_order_id)
+                result_list = res.get("result", {}).get("list", [])
+                if result_list:
+                    o = result_list[0]
+                    status = {
+                        "filled": float(o.get("cumExecQty", 0)),
+                        "value": float(o.get("cumExecValue", 0)),
+                        "status": o.get("status", "Unknown")
+                    }
+            
+            if not status:
+                continue
+            
+            # 🆕 CUMULATIVE FILL TRACKING
+            this_order_filled = status["filled"]
+            this_order_value = status["value"]
+            
+            # Only count NEW fills from this order (subtract what we already counted)
+            new_fills_qty = this_order_filled - (cumulative_filled_qty - realized_filled)
+            new_fills_value = this_order_value - (cumulative_filled_value - realized_value)
+            
+            if new_fills_qty > 0:
+                avg_fill_price = new_fills_value / new_fills_qty
+                if position_side in ["LONG", "Buy"]:
+                    new_pnl = (avg_fill_price - entry_price) * new_fills_qty
+                else:
+                    new_pnl = (entry_price - avg_fill_price) * new_fills_qty
+                
+                # Add to cumulative totals
+                cumulative_realized_pnl += new_pnl
+                cumulative_filled_qty += new_fills_qty
+                cumulative_filled_value += new_fills_value
+                
+                audit_log(f"{exchange.upper()} 💰 NEW FILL: +{new_fills_qty} @ ${avg_fill_price:.8f} | PNL: ${new_pnl:+.6f}")
+                audit_log(f"{exchange.upper()} 📊 CUMULATIVE: {cumulative_filled_qty}/{total_qty} filled | Realized: ${cumulative_realized_pnl:+.6f}")
+            
+            # Update tracking baselines
+            realized_filled = cumulative_filled_qty
+            realized_value = cumulative_filled_value
+            realized_pnl = cumulative_realized_pnl
+            remaining_qty = total_qty - cumulative_filled_qty
+            
+            # Update shared state
+            shared_exit_state[exchange]["realized_pnl"] = cumulative_realized_pnl
+            shared_exit_state[exchange]["remaining_qty"] = remaining_qty
+            
+            # Check if fully filled
+            if remaining_qty <= float_step:
+                audit_log(f"{exchange.upper()} 🎯 FULLY CLOSED!")
+                active_order_id = None
+    
+                # 🆕 CRITICAL FIX: Update shared state with FINAL values before marking done
+                shared_exit_state[exchange]["realized_pnl"] = realized_pnl
+                shared_exit_state[exchange]["unrealized_pnl"] = 0.0  # Position is closed, no unrealized left
+                shared_exit_state[exchange]["total_pnl"] = realized_pnl  # Final PNL
+                shared_exit_state[exchange]["remaining_qty"] = 0  # Position fully closed
+                shared_exit_state[exchange]["best_price"] = current_best_price  # Last known price
+                
+                shared_exit_state[exchange]["status"] = "done"
+                break
+            
+            # ====================================
+            # 🔥 CRITICAL: Check if ANY exchange's BBO changed!
+            # ====================================
+            
+            # Check MY BBO
+            if side.upper() in ["SELL", "Sell"]:
+                my_fresh_price = state[exchange]["ask"]
+            else:
+                my_fresh_price = state[exchange]["bid"]
+            
+            # Check OTHER exchange's BBO
+            if other_exchange in ["binance", "bybit"]:
+                other_side = "SELL" if shared_exit_state[other_exchange].get("position_side") in ["LONG", "Buy"] else "BUY"
+                if other_side == "SELL":
+                    other_fresh_price = state[other_exchange]["ask"]
+                else:
+                    other_fresh_price = state[other_exchange]["bid"]
+            else:
+                other_fresh_price = None
+            
+            my_bbo_changed = (locked_price and my_fresh_price != locked_price)
+            other_locked_price = shared_exit_state[other_exchange].get("locked_price")
+            other_bbo_changed = (other_locked_price and other_fresh_price and other_fresh_price != other_locked_price)
+            
+            # 🔥 IF ANY BBO CHANGED → CANCEL BOTH!
+            if my_bbo_changed or other_bbo_changed:
+                if my_bbo_changed:
+                    audit_log(f"🔄 {exchange.upper()} BBO CHANGED: ${locked_price:.8f} → ${my_fresh_price:.8f}")
+                if other_bbo_changed:
+                    audit_log(f"🔄 {other_exchange.upper()} BBO CHANGED: ${other_locked_price:.8f} → ${other_fresh_price:.8f}")
+                
+                audit_log(f"❌❌ CANCELING BOTH EXCHANGES! ❌❌")
+                
+                # Signal to other exchange to cancel too
+                shared_exit_state["cancel_trigger"] = True
+                shared_exit_state[exchange]["status"] = "canceling"
+                
+                # Cancel MY order
+                if exchange == "binance":
+                    binance_cancel_order(symbol, active_order_id)
+                else:
+                    bybit_cancel_order(symbol, active_order_id)
+                
+                await asyncio.sleep(0.1)
+                
+                # 🆕 Refetch MY fills with cumulative tracking
+                if exchange == "binance":
+                    res = binance_get_order(symbol, active_order_id)
+                    if res and "orderId" in res:
+                        this_order_filled = float(res.get("executedQty", 0))
+                        this_order_value = float(res.get("cumQuote", 0))
+                else:
+                    res = bybit_get_order(symbol, active_order_id)
+                    result_list = res.get("result", {}).get("list", [])
+                    if result_list:
+                        this_order_filled = float(result_list[0].get("cumExecQty", 0))
+                        this_order_value = float(result_list[0].get("cumExecValue", 0))
+                
+                # Only count NEW fills
+                new_fills = this_order_filled - (cumulative_filled_qty - realized_filled)
+                new_value = this_order_value - (cumulative_filled_value - realized_value)
+                
+                if new_fills > 0:
+                    avg_price = new_value / new_fills
+                    if position_side in ["LONG", "Buy"]:
+                        new_pnl = (avg_price - entry_price) * new_fills
+                    else:
+                        new_pnl = (entry_price - avg_price) * new_fills
+                    
+                    cumulative_realized_pnl += new_pnl
+                    cumulative_filled_qty += new_fills
+                    cumulative_filled_value += new_value
+                
+                # Update tracking
+                realized_filled = cumulative_filled_qty
+                realized_value = cumulative_filled_value
+                realized_pnl = cumulative_realized_pnl
+                remaining_qty = total_qty - cumulative_filled_qty
+                active_order_id = None
+                locked_price = None
+                
+                # Update shared state
+                shared_exit_state[exchange]["realized_pnl"] = realized_pnl
+                shared_exit_state[exchange]["remaining_qty"] = remaining_qty
+                shared_exit_state[exchange]["locked_price"] = None
+                
+                audit_log(f"{exchange.upper()} 📊 After cancel: Realized=${realized_pnl:+.6f}, Remaining={remaining_qty}")
+                
+                # Wait for other exchange to also cancel
+                wait_count = 0
+                while shared_exit_state[other_exchange]["status"] not in ["calculating", "waiting_pnl", "done"] and wait_count < 50:
+                    await asyncio.sleep(0.05)
+                    wait_count += 1
+                
+                # Reset cancel trigger
+                shared_exit_state["cancel_trigger"] = False
+                
+                # GO BACK TO OUTER LOOP (STEP 1) - BOTH EXCHANGES RESTART!
+                audit_log(f"{exchange.upper()} 🔄 RESTARTING FROM STEP 1...")
+                break
+            
+            # 🆕 Check if OTHER exchange triggered cancel
+            if shared_exit_state.get("cancel_trigger") and shared_exit_state[exchange]["status"] != "canceling":
+                audit_log(f"{exchange.upper()} ⚠️ OTHER EXCHANGE TRIGGERED CANCEL - Canceling my order too!")
+                
+                shared_exit_state[exchange]["status"] = "canceling"
+                
+                # Cancel MY order
+                if exchange == "binance":
+                    binance_cancel_order(symbol, active_order_id)
+                else:
+                    bybit_cancel_order(symbol, active_order_id)
+                
+                await asyncio.sleep(0.1)
+                
+                # 🆕 Refetch fills with cumulative tracking
+                if exchange == "binance":
+                    res = binance_get_order(symbol, active_order_id)
+                    if res and "orderId" in res:
+                        this_order_filled = float(res.get("executedQty", 0))
+                        this_order_value = float(res.get("cumQuote", 0))
+                else:
+                    res = bybit_get_order(symbol, active_order_id)
+                    result_list = res.get("result", {}).get("list", [])
+                    if result_list:
+                        this_order_filled = float(result_list[0].get("cumExecQty", 0))
+                        this_order_value = float(result_list[0].get("cumExecValue", 0))
+                
+                # Only count NEW fills
+                new_fills = this_order_filled - (cumulative_filled_qty - realized_filled)
+                new_value = this_order_value - (cumulative_filled_value - realized_value)
+                
+                if new_fills > 0:
+                    avg_price = new_value / new_fills
+                    if position_side in ["LONG", "Buy"]:
+                        new_pnl = (avg_price - entry_price) * new_fills
+                    else:
+                        new_pnl = (entry_price - avg_price) * new_fills
+                    
+                    cumulative_realized_pnl += new_pnl
+                    cumulative_filled_qty += new_fills
+                    cumulative_filled_value += new_value
+                
+                # Update tracking
+                realized_filled = cumulative_filled_qty
+                realized_value = cumulative_filled_value
+                realized_pnl = cumulative_realized_pnl
+                remaining_qty = total_qty - cumulative_filled_qty
+                active_order_id = None
+                locked_price = None
+                
+                shared_exit_state[exchange]["realized_pnl"] = cumulative_realized_pnl
+                shared_exit_state[exchange]["remaining_qty"] = remaining_qty
+                shared_exit_state[exchange]["locked_price"] = None
+                
+                audit_log(f"{exchange.upper()} 🔄 RESTARTING FROM STEP 1...")
+                break
+    
+    audit_log(f"{exchange.upper()} 🏁 EXIT COMPLETE: Realized PNL = ${realized_pnl:.6f}")
+
+    # 🆕 CRITICAL FIX: Update shared state with FINAL values before exiting function
+    shared_exit_state[exchange]["realized_pnl"] = realized_pnl
+    shared_exit_state[exchange]["unrealized_pnl"] = 0.0  # Position is closed
+    shared_exit_state[exchange]["total_pnl"] = realized_pnl  # Final total PNL
+    shared_exit_state[exchange]["remaining_qty"] = 0  # No position left
+    shared_exit_state[exchange]["status"] = "done"
+    shared_exit_state[exchange]["done"] = True
+
+    return realized_filled, realized_value
+
     # =========================
     # BYBIT PNL FETCHER (NEW)
     # =========================
@@ -1277,7 +1787,7 @@ def time_left_precise(ts):
 # =========================
 # PRINTER (UPDATED)
 # =========================
-async def printer(state, exchanges):
+async def printer(state, exchanges, shared_exit_state=None):
     while state.get("running", True):
         print("\n" + "=" * 90)
         # 1. Exchange Data
@@ -1331,6 +1841,15 @@ async def printer(state, exchanges):
             if proj_pnl is not None:
                 proj_color = "\033[92m" if proj_pnl >= 0 else "\033[91m"
                 print(f"⏳ Waiting for positive PNL... Current: {proj_color}${proj_pnl:+.3f}{reset}")
+
+            # 🆕 SHOW EXIT MODE PNL (access from state)
+            shared_exit_state = state.get("shared_exit_state")
+            if state.get("exit_triggered") and shared_exit_state:
+                b_pnl = shared_exit_state.get("binance", {}).get("total_pnl", 0)
+                y_pnl = shared_exit_state.get("bybit", {}).get("total_pnl", 0)
+                combined = b_pnl + y_pnl
+                color = "\033[92m" if combined >= 0 else "\033[91m"
+                print(f"🚪 EXIT MODE: Binance ${b_pnl:+.6f} + Bybit ${y_pnl:+.6f} = {color}${combined:+.6f}\033[0m")
         
         await asyncio.sleep(0.2)
 
@@ -1514,11 +2033,12 @@ async def main():
     
     # Sync with specific exchange for better accuracy
     print("\n🕐 Re-syncing with exchange time for precision...")
+    # Initial sync
     if "binance" in exchanges:
         get_binance_server_time()
     elif "bybit" in exchanges:
         get_bybit_server_time()
-
+    
     state = {
         "running": True,
         "net_pnl": None,
@@ -1530,6 +2050,11 @@ async def main():
         "exit_time": EXIT_TIME if exit_mode == "2" else "Funding Reset (+5s)",
         "exit_triggered": False
     }
+
+    sync_thread = threading.Thread(target=continuous_time_sync, args=(state, exchanges), daemon=True)
+    sync_thread.start()
+    audit_log("✅ Continuous time sync started (every 2 minutes)")
+
     position_info = {
         "binance": {"entry_price": None, "size": 0, "side": None},
         "bybit": {"entry_price": None, "size": 0, "side": None}
@@ -1583,8 +2108,11 @@ async def main():
                     if should_execute(state[exchange_to_check]["next_ts"], EXECUTION_TIME):
                         if sig and sig['spread'] >= MIN_SPREAD:
                             audit_log(f"🚀 EXECUTING HEDGE at {time_left(state[exchange_to_check]['next_ts'])}")
+                            # 🆕 Force sync before entry
+                            get_binance_server_time() if "binance" in exchanges else get_bybit_server_time()
+                            await asyncio.sleep(0.1)
                             audit_log(f"Strategy: Long {sig['long']}, Short {sig['short']}")
-                            
+
                             binance_set_leverage(binance_symbol, leverage)
                             bybit_set_leverage(bybit_symbol, leverage)
                             
@@ -1748,8 +2276,22 @@ async def main():
                     should_exit = should_execute(funding_time_snapshot, EXIT_TIME)
     
             if should_exit:
+                audit_log(f"{'='*90}")
+                # 🆕 Force sync before exit
+                get_binance_server_time() if "binance" in exchanges else get_bybit_server_time()
+                await asyncio.sleep(0.1)
+                audit_log(f"🚪 EXIT TIME REACHED!")
+                audit_log(f"   Exit Mode: {exit_mode}")
+                audit_log(f"   Funding Snapshot: {funding_time_snapshot}")
+                audit_log(f"   Current Positions:")
+                if "binance" in exchanges and position_info["binance"]["entry_price"]:
+                    audit_log(f"      Binance: {position_info['binance']['side']} {position_info['binance']['size']} @ ${position_info['binance']['entry_price']:.8f}")
+                if "bybit" in exchanges and position_info["bybit"]["entry_price"]:
+                    audit_log(f"      Bybit: {position_info['bybit']['side']} {position_info['bybit']['size']} @ ${position_info['bybit']['entry_price']:.8f}")
+                audit_log(f"{'='*90}")
+    
                 print(f"\n🚪 EXIT TIME REACHED! Now waiting for positive PNL...")
-                state["exit_triggered"] = True  # 🚀 TRIGGER ULTRA-HIGH FREQUENCY SYNC
+                state["exit_triggered"] = True
     
                 # 🆕 NEW FEATURE: Wait for positive PNL before exiting (REAL-TIME)
                 while True:
@@ -1762,44 +2304,74 @@ async def main():
                         continue
 
                     if projected_pnl >= 0:
-                        audit_log(f"✅ PNL is positive (${projected_pnl:+.3f})! Closing now...")
+                        audit_log(f"{'='*90}")
+                        audit_log(f"✅ PNL POSITIVE CONFIRMED!")
+                        audit_log(f"   Projected PNL: ${projected_pnl:+.6f}")
+                        if "binance" in exchanges:
+                            audit_log(f"   Binance Best ASK: ${state['binance']['ask']:.8f}")
+                        if "bybit" in exchanges:
+                            audit_log(f"   Bybit Best BID: ${state['bybit']['bid']:.8f}")
+                        audit_log(f"   Proceeding to close positions...")
+                        audit_log(f"{'='*90}")
                         break
                     
                     await asyncio.sleep(0.001)  # Check every 1ms with LIVE data (BG ONLY)
     
                 print(f"\n🚪 CLOSING ALL POSITIONS...")
+                
+                audit_log(f"🚪 INITIATING EXIT CHASERS ON BOTH EXCHANGES...")
 
-                # Execute BOTH at exact same millisecond
+                # 🆕 SHARED STATE FOR EXIT COORDINATION
+                shared_exit_state = {
+                    "binance": {
+                        "realized_pnl": 0, 
+                        "unrealized_pnl": 0, 
+                        "total_pnl": 0, 
+                        "remaining_qty": 0,
+                        "best_price": 0,
+                        "locked_price": None,
+                        "status": "ready",
+                        "done": False,
+                        "position_side": position_info["binance"]["side"] if "binance" in exchanges else None
+                    },
+                    "bybit": {
+                        "realized_pnl": 0, 
+                        "unrealized_pnl": 0, 
+                        "total_pnl": 0,
+                        "remaining_qty": 0,
+                        "best_price": 0,
+                        "locked_price": None,
+                        "status": "ready",
+                        "done": False,
+                        "position_side": position_info["bybit"]["side"] if "bybit" in exchanges else None
+                    },
+                    "cancel_trigger": False
+                }
+                
+                # Update printer to show exit PNL
+                state["shared_exit_state"] = shared_exit_state
+                
+                # 🆕 USE EXIT CHASER V3 WITH SHARED STATE
                 exit_tasks = []
 
                 if "binance" in exchanges and position_info["binance"]["entry_price"]:
                     side_to_close = "SELL" if position_info["binance"]["side"] == "LONG" else "BUY"
-                    qty = position_info["binance"]["size"]
-                    print(f"Closing Binance {position_info['binance']['side']} with {side_to_close} order...")
-                    exit_tasks.append(asyncio.to_thread(
-                        binance_order, binance_symbol, side_to_close, qty, binance_filters["step_size"]
+                    print(f"🚪 Closing Binance {position_info['binance']['side']} with EXIT CHASER V3...")
+                    exit_tasks.append(limit_order_exit_chaser_v3(
+                        "binance", binance_symbol, side_to_close, 
+                        state, binance_filters, trade_records, position_info, shared_exit_state
                     ))
-                else:
-                    exit_tasks.append(asyncio.sleep(0))
 
                 if "bybit" in exchanges and position_info["bybit"]["entry_price"]:
                     side_to_close = "Sell" if position_info["bybit"]["side"] == "Buy" else "Buy"
-                    qty = position_info["bybit"]["size"]
-                    print(f"Closing Bybit {position_info['bybit']['side']} with {side_to_close} order...")
-                    exit_tasks.append(asyncio.to_thread(
-                        bybit_order, bybit_symbol, side_to_close, qty, bybit_filters["step_size"]
+                    print(f"🚪 Closing Bybit {position_info['bybit']['side']} with EXIT CHASER V3...")
+                    exit_tasks.append(limit_order_exit_chaser_v3(
+                        "bybit", bybit_symbol, side_to_close, 
+                        state, bybit_filters, trade_records, position_info, shared_exit_state
                     ))
-                else:
-                    exit_tasks.append(asyncio.sleep(0))
 
-                # 🚀 BOTH EXECUTE SIMULTANEOUSLY
+                # Wait for both exit chasers to complete
                 results = await asyncio.gather(*exit_tasks)
-
-                # Store order IDs
-                if results[0] and isinstance(results[0], dict) and results[0].get("orderId"):
-                    trade_records["binance"]["exit_order_ids"].append(results[0]["orderId"])
-                if results[1] and isinstance(results[1], dict) and results[1].get("result", {}).get("orderId"):
-                    trade_records["bybit"]["exit_order_ids"].append(results[1]["result"]["orderId"])
                 
                 exit_fired = True
                 audit_log("✅ All positions closed!")
@@ -1816,7 +2388,10 @@ async def main():
                 break
             
             await asyncio.sleep(0.05)
-    tasks.append(printer(state, exchanges))
+    # Create a holder for shared_exit_state (will be set later)
+    shared_exit_state_holder = {}
+    
+    tasks.append(printer(state, exchanges, lambda: state.get("shared_exit_state")))
     tasks.append(execution_watcher(position_info))
     tasks.append(exit_watcher())
     await asyncio.gather(*tasks)

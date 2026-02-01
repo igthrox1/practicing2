@@ -10,7 +10,6 @@ from urllib.parse import urlencode
 from decimal import Decimal, ROUND_DOWN
 import ntplib
 from datetime import datetime
-import math
 
 # =========================
 # TIME SYNC CORRECTION
@@ -86,7 +85,7 @@ def sync_time_with_ntp():
 
 def get_binance_server_time():
     """Get accurate server time from Binance"""
-    global TIME_OFFSET, MANUAL_ADJUST
+    global TIME_OFFSET
     try:
         # Get Binance server time
         response = requests.get("https://fapi.binance.com/fapi/v1/time", timeout=3)
@@ -98,14 +97,6 @@ def get_binance_server_time():
         
         # Calculate offset
         TIME_OFFSET = server_time - local_time
-        
-        # 🆕 AUTO-ADJUST: If offset is too big, apply it to MANUAL_ADJUST
-        if abs(TIME_OFFSET) > 5:
-            print(f"⚠️  CRITICAL: Your clock is {TIME_OFFSET:.1f}s off!")
-            print(f"🔧 AUTO-ADJUSTING MANUAL_ADJUST from {MANUAL_ADJUST} to {int(TIME_OFFSET)}")
-            MANUAL_ADJUST = int(TIME_OFFSET)
-            TIME_OFFSET = 0  # Reset offset since we moved it to manual adjust
-            print(f"✅ Auto-correction applied! New timestamps will be accurate.")
         
         print(f"✅ Synced with Binance server")
         print(f"   Server time offset: {TIME_OFFSET:.3f} seconds")
@@ -120,7 +111,7 @@ def get_binance_server_time():
 
 def get_bybit_server_time():
     """Get accurate server time from Bybit"""
-    global TIME_OFFSET, MANUAL_ADJUST
+    global TIME_OFFSET
     try:
         # Get Bybit server time
         response = requests.get("https://api.bybit.com/v5/market/time", timeout=3)
@@ -133,14 +124,6 @@ def get_bybit_server_time():
         # Calculate offset
         TIME_OFFSET = server_time - local_time
         
-        # 🆕 AUTO-ADJUST: If offset is too big, apply it to MANUAL_ADJUST
-        if abs(TIME_OFFSET) > 5:
-            print(f"⚠️  CRITICAL: Your clock is {TIME_OFFSET:.1f}s off!")
-            print(f"🔧 AUTO-ADJUSTING MANUAL_ADJUST from {MANUAL_ADJUST} to {int(TIME_OFFSET)}")
-            MANUAL_ADJUST = int(TIME_OFFSET)
-            TIME_OFFSET = 0  # Reset offset since we moved it to manual adjust
-            print(f"✅ Auto-correction applied! New timestamps will be accurate.")
-        
         print(f"✅ Synced with Bybit server")
         print(f"   Server time offset: {TIME_OFFSET:.3f} seconds")
         print(f"   Manual adjustment: {MANUAL_ADJUST:+d} seconds")
@@ -151,6 +134,7 @@ def get_bybit_server_time():
     except Exception as e:
         print(f"❌ Failed to sync with Bybit: {e}")
         return False
+
 # =========================
 # BINANCE WS (MARK + FUNDING)
 # =========================
@@ -302,13 +286,13 @@ def binance_set_leverage(symbol, lev):
         return {}
 
 def get_binance_symbol_filters(symbol):
-    """Fetch LOT_SIZE stepSize, PRICE_FILTER tickSize, and MIN_NOTIONAL from Binance API"""
+    """Fetch LOT_SIZE stepSize and PRICE_FILTER tickSize from Binance API"""
     try:
         url = BINANCE_URL + "/fapi/v1/exchangeInfo"
         r = requests.get(url, timeout=3)
         data = r.json()
         
-        filters = {"step_size": "1", "tick_size": "0.01", "min_notional": "5.0"}
+        filters = {"step_size": "1", "tick_size": "0.01"}
         for s in data.get("symbols", []):
             if s["symbol"] == symbol:
                 for f in s.get("filters", []):
@@ -316,15 +300,13 @@ def get_binance_symbol_filters(symbol):
                         filters["step_size"] = f["stepSize"]
                     if f["filterType"] == "PRICE_FILTER":
                         filters["tick_size"] = f["tickSize"]
-                    if f["filterType"] == "MIN_NOTIONAL":
-                        filters["min_notional"] = f["notional"]
-                
-                print(f"📏 Binance {symbol}: step={filters['step_size']}, tick={filters['tick_size']}, min_notional=${filters['min_notional']}")
                 return filters
         return filters
     except Exception as e:
         print(f"⚠️ CRITICAL: Failed to fetch Binance filters: {e}")
-        return None
+        print(f"⚠️ Cannot continue without symbol info. Please check API connection.")
+        return None  # ✅ Return None to signal failure
+
 
 def round_step_size(quantity, step_size):
     """Round quantity to match stepSize precision (Floor)"""
@@ -348,55 +330,6 @@ def round_price(price, tick_size):
     rounded = float(price.quantize(tick_size, rounding=ROUND_DOWN))
     return rounded
 
-# =========================
-# BINANCE ERROR HANDLER
-# =========================
-def handle_binance_min_notional_error(res, qty_to_order, target_price):
-    """
-    Specifically handle Binance's minimum notional error (-4164).
-    Returns dict if it's a dust order we should accept.
-    Returns None for other -4164 errors (should retry).
-    """
-    if "code" in res and res["code"] == -4164:
-        msg = res.get("msg", "").lower()
-        
-        # Check if this is specifically a minimum notional error
-        if "notional" in msg and "no smaller than" in msg:
-            # Extract the minimum value from error message
-            import re
-            match = re.search(r'no smaller than ([\d\.]+)', msg)
-            min_notional = float(match.group(1)) if match else None
-            
-            audit_log(f"💡 Minimum order value error: {res.get('msg')}")
-            
-            if min_notional:
-                audit_log(f"📊 Binance minimum: ${min_notional:.2f}, Our order: ${qty_to_order * target_price:.2f}")
-                
-                # Check if we're below minimum
-                if qty_to_order * target_price < min_notional:
-                    audit_log(f"💎 Accepting dust order (below minimum ${min_notional:.2f})")
-                    return {
-                        "code": -4164,
-                        "msg": "Dust order accepted",
-                        "is_min_notional": True,
-                        "min_notional": min_notional,
-                        "our_notional": qty_to_order * target_price
-                    }
-            
-            # Even if we can't parse the exact value, if it's a notional error, accept it
-            audit_log(f"💎 Accepting dust mismatch")
-            return {
-                "code": -4164,
-                "msg": "Dust order accepted",
-                "is_min_notional": True
-            }
-        else:
-            # Other type of -4164 error (could be position, reduce-only, etc.)
-            audit_log(f"⚠️ Other -4164 error: {res.get('msg')}. Will retry...")
-            return None  # Signal to retry
-    
-    return None  # Not a handled error
-
 def binance_limit_order(symbol, side, qty, price, step_size, tick_size):
     for attempt in range(3):
         try:
@@ -411,16 +344,9 @@ def binance_limit_order(symbol, side, qty, price, step_size, tick_size):
                 "timeInForce": "GTX",  # Post-Only
                 "timestamp": int(get_accurate_time()*1000)
             })
-            audit_log(f"Binance Limit Req: {side} {qty} @ {price:.8f} (Post-Only) | Attempt {attempt+1}")
+            audit_log(f"Binance Limit Req: {side} {qty} @ {price} (Post-Only) | Attempt {attempt+1}")
             r = requests.post(BINANCE_URL + "/fapi/v1/order", headers={"X-MBX-APIKEY": BINANCE_KEY}, params=params, timeout=5)
             res = r.json()
-            
-            # ✅ NEW: Check for minimum notional dust order error
-            dust_check = handle_binance_min_notional_error(res, qty, price)
-            if dust_check and dust_check.get("is_min_notional"):
-                # This was a dust order below minimum, accept it as filled
-                audit_log(f"✅ Accepting dust order as filled: ${qty * price:.8f}")
-                return dust_check  # Return the dust check result
             
             # Check for transient errors
             if "code" in res and res["code"] in [-1001, -1003, -1007, -1021]:
@@ -474,19 +400,6 @@ def binance_order(symbol, side, qty, step_size):
             })
             r = requests.post(BINANCE_URL + "/fapi/v1/order", headers={"X-MBX-APIKEY": BINANCE_KEY}, params=params, timeout=5)
             res = r.json()
-            
-            # ✅ NEW: Check for minimum notional dust order error (for market orders too)
-            # We need the price for calculation - use current market price
-            if "code" in res and res["code"] == -4164:
-                msg = res.get("msg", "").lower()
-                if "notional" in msg and "no smaller than" in msg:
-                    audit_log(f"💡 Binance MARKET dust order: {res.get('msg')}")
-                    audit_log(f"💎 Accepting dust order as filled")
-                    return {
-                        "code": -4164,
-                        "msg": "Dust order accepted",
-                        "is_min_notional": True
-                    }
             
             if "code" in res and res["code"] in [-1001, -1003, -1007, -1021]:
                 audit_log(f"⚠️ Binance Market transient error {res['code']}: {res.get('msg')}. Retrying...")
@@ -641,31 +554,24 @@ def bybit_set_leverage(symbol, lev):
         return {}
 
 def get_bybit_symbol_filters(symbol):
-    """Fetch Bybit instrument info for qty step, tick size, and min notional"""
+    """Fetch Bybit instrument info for qty step and tick size"""
     try:
         url = BYBIT_URL + f"/v5/market/instruments-info?category=linear&symbol={symbol}"
         r = requests.get(url, timeout=3)
         data = r.json()
         
-        filters = {"step_size": "1", "tick_size": "0.01", "min_notional": "10.0"}
+        filters = {"step_size": "1", "tick_size": "0.01"}
         if data.get("retCode") == 0:
             result = data.get("result", {}).get("list", [])
             if result:
-                instrument = result[0]
-                filters["step_size"] = instrument.get("lotSizeFilter", {}).get("qtyStep", "1")
-                filters["tick_size"] = instrument.get("priceFilter", {}).get("tickSize", "0.01")
-                
-                # Bybit's minimum order value
-                min_order_amt = instrument.get("lotSizeFilter", {}).get("minOrderAmt", None)
-                if min_order_amt:
-                    filters["min_notional"] = min_order_amt
-                
-                print(f"📏 Bybit {symbol}: step={filters['step_size']}, tick={filters['tick_size']}, min_notional=${filters['min_notional']}")
+                filters["step_size"] = result[0].get("lotSizeFilter", {}).get("qtyStep", "1")
+                filters["tick_size"] = result[0].get("priceFilter", {}).get("tickSize", "0.01")
                 return filters
         return filters
     except Exception as e:
         print(f"⚠️ CRITICAL: Failed to fetch Bybit filters: {e}")
-        return None
+        print(f"⚠️ Cannot continue without symbol info. Please check API connection.")
+        return None  # ✅ Return None to signal failure
 
 def bybit_limit_order(symbol, side, qty, price, step_size, tick_size):
     for attempt in range(3):
@@ -684,7 +590,7 @@ def bybit_limit_order(symbol, side, qty, price, step_size, tick_size):
             }
             signature = bybit_sign({}, timestamp, json.dumps(params))
             headers = {"X-BAPI-API-KEY": BYBIT_KEY, "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-SIGN": signature, "X-BAPI-RECV-WINDOW": "5000", "Content-Type": "application/json"}
-            audit_log(f"Bybit Limit Req: {side} {qty} @ {price:.8f} (Post-Only) | Attempt {attempt+1}")
+            audit_log(f"Bybit Limit Req: {side} {qty} @ {price} (Post-Only) | Attempt {attempt+1}")
             r = requests.post(BYBIT_URL + "/v5/order/create", headers=headers, json=params, timeout=5)
             res = r.json()
             
@@ -769,132 +675,25 @@ def bybit_order(symbol, side, qty, step_size):
             if attempt < 2: time.sleep(1)
     return {}
 
-async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, trade_records, shared_fill_state):
-    step_size = filters["step_size"]
-    tick_size = filters["tick_size"]
-    min_notional = float(filters["min_notional"])
-    
-    audit_log(f"🏁 ULTRA-AGGRESSIVE CHASER START: {exchange.upper()} | {side} {total_qty} | Min: ${min_notional}")
-    # 🆕 CRITICAL: Check if INITIAL target meets minimum notional
-    if side.upper() in ["BUY", "LONG", "Buy"]:
-        initial_price = state[exchange]["bid"]
-    else:
-        initial_price = state[exchange]["ask"]
-    
-    if initial_price > 0:
-        initial_value = total_qty * initial_price
-        if initial_value < min_notional:
-            audit_log(f"{exchange.upper()} ⚠️ INITIAL TARGET ${initial_value:.2f} < MIN ${min_notional}")
-            
-            # Boost to meet minimum
-            boosted_qty = math.ceil(min_notional / initial_price)
-            boosted_qty = round_step_size(boosted_qty, step_size)
-            
-            audit_log(f"{exchange.upper()} 🎯 BOOSTING from {total_qty} to {boosted_qty} coins (${boosted_qty * initial_price:.2f})")
-            total_qty = boosted_qty
+async def limit_order_chaser(exchange, symbol, side, total_qty, state, step_size, tick_size, trade_records):
+    audit_log(f"🏁 ULTRA-AGGRESSIVE CHASER START: {exchange.upper()} | {side} {total_qty}")
     remaining_qty = total_qty
-
     active_order_id = None
     iteration = 0
     total_filled = 0.0
-    total_value = 0.0
     filled_baseline = 0.0  # ✅ Track fills before current order
-    value_baseline = 0.0   # ✅ Track value before current order
+    last_price = None  # ✅ Track last order price
     
     float_step = float(step_size)
     
     while remaining_qty >= float_step:
         iteration += 1
-        qty_to_order = remaining_qty
         
-        # 🆕 CHECK IF OTHER SIDE FINISHED FIRST
-        # 🆕 CHECK IF OTHER SIDE FINISHED FIRST
-        other_exchange = "bybit" if exchange == "binance" else "binance"
-        if shared_fill_state[other_exchange]["done"] and not shared_fill_state[exchange]["done"]:
-    
-            # 🎯 LOCK the target USDT value once (first time we see it)
-            if "locked_target_usdt" not in shared_fill_state[exchange]:
-                shared_fill_state[exchange]["locked_target_usdt"] = shared_fill_state[other_exchange]["filled_usdt"]
-                audit_log(f"{exchange.upper()} 🔒 LOCKING TARGET: ${shared_fill_state[exchange]['locked_target_usdt']:.4f}")
-    
-            target_usdt = shared_fill_state[exchange]["locked_target_usdt"]
-            current_price = state[exchange]["bid"] if side.upper() in ["BUY", "LONG", "Buy"] else state[exchange]["ask"]
-    
-            if current_price > 0:
-                needed_usdt = target_usdt - total_value
-                if needed_usdt <= 0:
-                    audit_log(f"{exchange.upper()} 🎯 MATCHED {other_exchange.upper()}'S ${target_usdt:.2f}! Stopping.")
-                    break
-        
-                # Calculate needed quantity
-                needed_qty = needed_usdt / current_price
-                needed_qty_down = round_step_size(needed_qty, step_size)
-                needed_qty_up = needed_qty_down + float(step_size)
-        
-                # Calculate USDT values
-                value_down = needed_qty_down * current_price
-                value_up = needed_qty_up * current_price
-                
-                # Choose the closer one
-                delta_down = abs(target_usdt - (total_value + value_down))
-                delta_up = abs(target_usdt - (total_value + value_up))
-        
-                if delta_down <= delta_up:
-                    needed_qty_rounded = needed_qty_down
-                    audit_log(f"{exchange.upper()} 🤓 SMART ROUND: {needed_qty:.3f} → {needed_qty_down} (DOWN, Δ=${delta_down:.3f})")
-                else:
-                    needed_qty_rounded = needed_qty_up  
-                    audit_log(f"{exchange.upper()} 🤓 SMART ROUND: {needed_qty:.3f} → {needed_qty_up} (UP, Δ=${delta_up:.3f})")
-        
-                # 🔥 CRITICAL FIX: Only cancel if target ACTUALLY changed
-                new_total_qty = total_filled + needed_qty_rounded
-        
-                if abs(new_total_qty - total_qty) > float(step_size) * 0.5 and active_order_id:
-                    audit_log(f"{exchange.upper()} 🔄 Target changed from {total_qty} to {new_total_qty}! Canceling...")
-            
-                    # Cancel and refetch fills
-                    if exchange == "binance":
-                        binance_cancel_order(symbol, active_order_id)
-                        await asyncio.sleep(0.1)
-                        res = binance_get_order(symbol, active_order_id)
-                        if res and "orderId" in res:
-                            final_filled = float(res.get("executedQty", 0))
-                            final_value = float(res.get("cumQuote", 0))
-                            total_filled = filled_baseline + final_filled
-                            total_value = value_baseline + final_value
-                    else:
-                        bybit_cancel_order(symbol, active_order_id)
-                        await asyncio.sleep(0.1)
-                        res = bybit_get_order(symbol, active_order_id)
-                        result_list = res.get("result", {}).get("list", [])
-                        if result_list:
-                            final_filled = float(result_list[0].get("cumExecQty", 0))
-                            final_value = float(result_list[0].get("cumExecValue", 0))
-                            total_filled = filled_baseline + final_filled
-                            total_value = value_baseline + final_value
-                    
-                    active_order_id = None
-        
-                # Update targets
-                total_qty = new_total_qty
-                remaining_qty = total_qty - total_filled
-        
-                audit_log(f"{exchange.upper()} 🎯 Target: {total_qty:.1f} coins (${target_usdt:.4f}) | Filled: {total_filled:.1f} | Remaining: {remaining_qty:.1f}")
-
-# ✅ Get current BBO (bid/ask, NOT mark price)        
         # ✅ Get current BBO (bid/ask, NOT mark price)
-
         if side.upper() in ["BUY", "LONG", "Buy"]:
             target_price = state[exchange]["bid"]  # Join the best bid
         else:
             target_price = state[exchange]["ask"]  # Join the best ask
-            
-        # ✅ CRITICAL FIX: If bid/ask is 0 (WS data not ready), wait!
-        if target_price <= 0:
-            if iteration % 10 == 0:
-                audit_log(f"⏳ {exchange.upper()} waiting for valid BBO (current: {target_price})")
-            await asyncio.sleep(0.1)
-            continue
         
         if active_order_id:
             # ✅ Fetch order status
@@ -904,7 +703,6 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
                 if res and "orderId" in res:
                     status = {
                         "filled": float(res.get("executedQty", 0)),
-                        "value": float(res.get("cumQuote", 0)),
                         "price": float(res.get("price", 0)),
                         "status": res.get("status", "UNKNOWN")
                     }
@@ -915,7 +713,6 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
                     o = result_list[0]
                     status = {
                         "filled": float(o.get("cumExecQty", 0)),
-                        "value": float(o.get("cumExecValue", 0)),
                         "price": float(o.get("price", 0)),
                         "status": o.get("status", "Unknown")
                     }
@@ -927,68 +724,16 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
             
             # Update fills
             current_delta = float(status["filled"])
-            current_value_delta = float(status.get("value", 0))
             total_filled = filled_baseline + current_delta
-            total_value = value_baseline + current_value_delta
             remaining_qty = total_qty - total_filled
             
             audit_log(f"{exchange.upper()} 🔍 Iter#{iteration}: Filled {total_filled}/{total_qty} | "
-         f"Order@{status['price']:.8f} | Target@{target_price:.8f}")
-
-        # Check maker/taker ratio every 5 iterations
-        if iteration % 5 == 0 and active_order_id:
-            maker_count = 0
-            taker_count = 0
+                     f"Order@{status['price']:.4f} | Target@{target_price:.4f}")
             
-            if exchange == "binance":
-                # Fetch trades for this order
-                params = binance_sign({
-                    "symbol": symbol,
-                    "orderId": active_order_id,
-                    "timestamp": int(get_accurate_time() * 1000)
-                })
-                try:
-                    r = requests.get(BINANCE_URL + "/fapi/v1/userTrades", 
-                                   headers={"X-MBX-APIKEY": BINANCE_KEY}, 
-                                   params=params, timeout=2)
-                    trades = r.json()
-                    if isinstance(trades, list):
-                        maker_count = sum(1 for t in trades if t.get("maker"))
-                        taker_count = len(trades) - maker_count
-                except: pass
-            else:  # bybit
-                timestamp = str(int(get_accurate_time() * 1000))
-                params = {"category": "linear", "symbol": symbol, "orderId": active_order_id}
-                signature = bybit_sign(params, timestamp, "")
-                queryString = urlencode(sorted(params.items()))
-                url = f"{BYBIT_URL}/v5/execution/list?{queryString}"
-                headers = {"X-BAPI-API-KEY": BYBIT_KEY, "X-BAPI-TIMESTAMP": timestamp, 
-                  "X-BAPI-SIGN": signature, "X-BAPI-RECV-WINDOW": "5000"}
-                try:
-                    r = requests.get(url, headers=headers, timeout=2)
-                    data = r.json()
-                    if data.get("retCode") == 0:
-                        execs = data.get("result", {}).get("list", [])
-                        maker_count = sum(1 for e in execs if e.get("isMaker") == "true")
-                        taker_count = len(execs) - maker_count
-                except: pass
-    
-            if maker_count + taker_count > 0:
-                maker_pct = (maker_count / (maker_count + taker_count)) * 100
-                audit_log(f"{exchange.upper()} 📊 Fill Quality: {maker_count}M/{taker_count}T ({maker_pct:.1f}% Maker)")
             # ✅ Check if fully filled
-            if remaining_qty <= float(step_size):
-                audit_log(f"🎯 {exchange.upper()} FULLY FILLED! (by quantity)")
+            if remaining_qty <= 0.001 or status["status"] in ["FILLED", "Filled"]:
+                audit_log(f"🎯 {exchange.upper()} FULLY FILLED!")
                 break
-            elif status["status"] in ["FILLED", "Filled"]:
-                # Order says filled but we might have remaining_qty > 0
-                # This happens when order partially filled and was canceled
-                audit_log(f"🎯 {exchange.upper()} Order marked as {status['status']}, remaining: {remaining_qty}")
-                # Don't break! Let it continue with remaining quantity
-                if remaining_qty <= float(step_size):
-                    break
-                active_order_id = None
-                continue
             
             # ✅ Handle terminal states
             terminal_states = {
@@ -1004,7 +749,7 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
             
             # ✅ ULTRA-AGGRESSIVE: Cancel if price moves by more than 1 tick
             if abs(status["price"] - target_price) >= float(tick_size):
-                audit_log(f"{exchange.upper()} 🔄 PRICE MOVED >= TICK! {status['price']:.8f} → {target_price:.8f} | CANCELING!")
+                audit_log(f"{exchange.upper()} 🔄 PRICE MOVED >= TICK! {status['price']:.4f} → {target_price:.4f} | CANCELING!")
                 
                 # Cancel order
                 if exchange == "binance":
@@ -1020,16 +765,13 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
                     res = binance_get_order(symbol, active_order_id)
                     if res and "orderId" in res:
                         final_filled = float(res.get("executedQty", 0))
-                        final_value = float(res.get("cumQuote", 0))
                 else:
                     res = bybit_get_order(symbol, active_order_id)
                     result_list = res.get("result", {}).get("list", [])
                     if result_list:
                         final_filled = float(result_list[0].get("cumExecQty", 0))
-                        final_value = float(result_list[0].get("cumExecValue", 0))
                 
                 total_filled = filled_baseline + float(final_filled)
-                total_value = value_baseline + float(final_value)
                 remaining_qty = total_qty - total_filled
                 
                 audit_log(f"{exchange.upper()} 📉 Post-cancel: Filled={total_filled}, Remaining={remaining_qty}")
@@ -1048,24 +790,13 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
         
         # ✅ Place new order if none active
         if not active_order_id and remaining_qty >= float_step:
-            # 🆕 Check minimum notional (exchange-specific)
-            if qty_to_order * target_price < min_notional:
-                min_qty_needed = math.ceil(min_notional / target_price)
-                min_qty_needed = round_step_size(min_qty_needed, step_size)
-
-                if min_qty_needed <= remaining_qty:
-                    qty_to_order = min_qty_needed
-                    audit_log(f"{exchange.upper()} 🎯 Boosting order to ${qty_to_order * target_price:.2f} (min ${min_notional})")
-                else:
-                    # Can't meet min, accept dust
-                    audit_log(f"{exchange.upper()} 🧹 Accepting ${remaining_qty * target_price:.2f} dust (below ${min_notional} min)")
-                    break
+            qty_to_order = round_step_size(remaining_qty, step_size)
             
             if qty_to_order <= 0:
                 audit_log(f"{exchange.upper()} 🧹 Dust remaining ({remaining_qty}), finishing.")
                 break
             
-            audit_log(f"{exchange.upper()} 🆕 Placing {side} @ {target_price:.8f} for {qty_to_order}")
+            audit_log(f"{exchange.upper()} 🆕 Placing {side} @ {target_price:.4f} for {qty_to_order}")
             
             res = {}
             if exchange == "binance":
@@ -1080,82 +811,17 @@ async def limit_order_chaser(exchange, symbol, side, total_qty, state, filters, 
                 trade_records[exchange]["entry_order_ids"].append(active_order_id)
 
             if not active_order_id:
-                # ✅ Check if this was a dust order that we should accept
-                if exchange == "binance" and res.get("code") == -4164 and res.get("is_min_notional"):
-                    audit_log(f"{exchange.upper()} 💎 DUST DETECTED: qty={qty_to_order}, value=${qty_to_order*target_price:.6f}")
-                    audit_log(f"{exchange.upper()} 💎 Dust order accepted as filled: ${qty_to_order * target_price:.2f}")
-                    total_filled += qty_to_order
-                    total_value += qty_to_order * target_price
-                    remaining_qty = total_qty - total_filled
-                    audit_log(f"{exchange.upper()} 🧹 Dust accumulation: {total_filled}/{total_qty}")
-                    
-                    if remaining_qty <= float_step:
-                        audit_log(f"{exchange.upper()} 🏁 Chaser finished via dust acceptance")
-                        break
-                    else:
-                        continue  # Try next chunk
-                else:
-                    audit_log(f"{exchange.upper()} ⚠️ Order rejected: {json.dumps(res)}")
-                    await asyncio.sleep(0.2)
-                    continue
+                audit_log(f"{exchange.upper()} ⚠️ Order rejected: {json.dumps(res)}")
+                await asyncio.sleep(0.2)
+                continue
             
+            last_price = target_price  # Track this order's price
             filled_baseline = total_filled # ✅ Store fills BEFORE this order
-            value_baseline = total_value   # ✅ Store value BEFORE this order
             audit_log(f"{exchange.upper()} ✅ Order placed: {active_order_id}")
-            maker_count = 0
-            taker_count = 0
         
         await asyncio.sleep(0.02)  # ✅ ULTRA-FAST loop (50 checks/sec)
     
-    # Final maker/taker check
-    final_maker = 0
-    final_taker = 0
-    if exchange == "binance":
-        params = binance_sign({
-            "symbol": symbol,
-            "limit": 100,
-            "timestamp": int(get_accurate_time() * 1000)
-        })
-        try:
-            r = requests.get(BINANCE_URL + "/fapi/v1/userTrades", 
-                       headers={"X-MBX-APIKEY": BINANCE_KEY}, 
-                       params=params, timeout=3)
-            trades = r.json()
-            if isinstance(trades, list):
-                # Filter trades from our order IDs
-                our_trades = [t for t in trades if str(t.get("orderId")) in [str(o) for o in trade_records[exchange]["entry_order_ids"]]]
-                final_maker = sum(1 for t in our_trades if t.get("maker"))
-                final_taker = len(our_trades) - final_maker
-        except: pass
-    else:  # bybit
-        timestamp = str(int(get_accurate_time() * 1000))
-        params = {"category": "linear", "symbol": symbol, "limit": "100"}
-        signature = bybit_sign(params, timestamp, "")
-        queryString = urlencode(sorted(params.items()))
-        url = f"{BYBIT_URL}/v5/execution/list?{queryString}"
-        headers = {"X-BAPI-API-KEY": BYBIT_KEY, "X-BAPI-TIMESTAMP": timestamp, 
-              "X-BAPI-SIGN": signature, "X-BAPI-RECV-WINDOW": "5000"}
-        try:
-            r = requests.get(url, headers=headers, timeout=3)
-            data = r.json()
-            if data.get("retCode") == 0:
-                execs = data.get("result", {}).get("list", [])
-                our_execs = [e for e in execs if str(e.get("orderId")) in [str(o) for o in trade_records[exchange]["entry_order_ids"]]]
-                final_maker = sum(1 for e in our_execs if e.get("isMaker") == "true")
-                final_taker = len(our_execs) - final_maker
-        except: pass
-
-    maker_pct = (final_maker / (final_maker + final_taker) * 100) if (final_maker + final_taker) > 0 else 0
-
-    # 🆕 Mark this exchange as done
-    shared_fill_state[exchange]["done"] = True
-    shared_fill_state[exchange]["filled_usdt"] = total_value
-    shared_fill_state[exchange]["filled_qty"] = total_filled
-
-    audit_log(f"{exchange.upper()} 🏁 CHASER FINISHED: {total_filled}/{total_qty} filled | Total Value: ${total_value:.8f}")
-    audit_log(f"{exchange.upper()} 📊 ENTRY QUALITY: {final_maker} Maker / {final_taker} Taker ({maker_pct:.1f}% Maker)")
-
-    return total_filled, total_value
+    audit_log(f"{exchange.upper()} 🏁 CHASER FINISHED: {total_filled}/{total_qty} filled")
 
     # =========================
     # BYBIT PNL FETCHER (NEW)
@@ -1282,8 +948,8 @@ async def printer(state, exchanges):
         print("\n" + "=" * 90)
         # 1. Exchange Data
         for ex in exchanges:
-            price_str = f"{state[ex]['price']:.8f}" if state[ex]['price'] else "N/A"
-            funding_str = f"{state[ex]['funding']:.6f}%" if state[ex]['funding'] is not None else "N/A"
+            price_str = f"{state[ex]['price']:.6f}" if state[ex]['price'] else "N/A"
+            funding_str = f"{state[ex]['funding']:.4f}%" if state[ex]['funding'] is not None else "N/A"
             time_str = time_left(state[ex]['next_ts'])
             
             pnl = state[ex].get("pnl", None)
@@ -1295,8 +961,8 @@ async def printer(state, exchanges):
             else:
                 pnl_display = "Waiting..."
             
-            print(f"{ex.upper():7} | Price: {price_str} | B/A: {state[ex]['bid']:.8f}/{state[ex]['ask']:.8f} | "
-                  f"Funding: {funding_str} | Time: {time_str} | PNL: {pnl_display}")
+            print(f"{ex.upper():7} | Price: {price_str} | Funding: {funding_str} | "
+                  f"Time: {time_str} | PNL: {pnl_display}")
             
         # 2. Strategy & Signal Status
         print("-" * 90)
@@ -1304,7 +970,7 @@ async def printer(state, exchanges):
             sig = state.get("signal")
             if sig:
                 print(f"📡 SIGNAL ACTIVE: LONG {sig['long'].upper()} / SHORT {sig['short'].upper()}")
-                print(f"   Spread: {sig['spread']:.6f}% | Target Req: {state.get('min_spread')}%")
+                print(f"   Spread: {sig['spread']:.4f}% | Target Req: {state.get('min_spread')}%")
             else:
                 print(f"📡 SEARCHING: Scanning for arbitrage spread > {state.get('min_spread')}%...")
             
@@ -1404,8 +1070,7 @@ async def generate_final_report(trade_records, coin):
     """Generate and display final trade report with retries for late data"""
     audit_log("\n" + "="*40 + " FINAL TRADE REPORT " + "="*40)
     total_fee = 0.0
-    total_gross_pnl = 0.0
-    total_net_pnl = 0.0
+    total_realized_pnl = 0.0
     
     # Wait 3 seconds instead of 1 for exchange sync
     await asyncio.sleep(3)
@@ -1436,48 +1101,29 @@ async def generate_final_report(trade_records, coin):
                 fees = sum(float(t.get("commission") or t.get("execFee", 0)) for t in trades)
                 asset = trades[0].get("commissionAsset") if (trades and exchange == "binance") else ("USDT" if trades else "")
                 avg_price = total_val / total_qty if total_qty > 0 else 0
+                return total_qty, avg_price, fees, asset
 
-                # Count maker/taker
-                if exchange == "binance":
-                    maker = sum(1 for t in trades if t.get("maker"))
-                    taker = len(trades) - maker  # ✅ FIX: Define taker for binance too!
-                else:  # bybit
-                    maker = sum(1 for t in trades if t.get("isMaker") == "true")
-                    taker = len(trades) - maker
-
-                return total_qty, avg_price, fees, asset, maker, taker
-
-            ent_qty, ent_p, ent_f, ent_a, ent_m, ent_t = process_trades(entry_trades, ex)
-            ext_qty, ext_p, ext_f, ext_a, ext_m, ext_t = process_trades(exit_trades, ex)
+            ent_qty, ent_p, ent_f, ent_a = process_trades(entry_trades, ex)
+            ext_qty, ext_p, ext_f, ext_a = process_trades(exit_trades, ex)
             
-            # Calculate PNL for this side
+            # Calculate REALIZED PNL for this side
             side = trade_records[ex]['side']
             if side in ["LONG", "Buy"]:
-                gross_pnl = (ext_p - ent_p) * min(ent_qty, ext_qty)
+                realized_pnl = (ext_p - ent_p) * min(ent_qty, ext_qty) - (ent_f + ext_f)
             else: # SHORT or Sell
-                gross_pnl = (ent_p - ext_p) * min(ent_qty, ext_qty)
+                realized_pnl = (ent_p - ext_p) * min(ent_qty, ext_qty) - (ent_f + ext_f)
             
-            fees = ent_f + ext_f
-            net_pnl = gross_pnl - fees
-            
-            total_fee += fees
-            total_gross_pnl += gross_pnl
-            total_net_pnl += net_pnl
+            total_fee += (ent_f + ext_f)
+            total_realized_pnl += realized_pnl
             
             audit_log(f"[{ex.upper()}] Side: {side}")
-            ent_maker_pct = (ent_m / (ent_m + ent_t) * 100) if (ent_m + ent_t) > 0 else 0
-            ext_maker_pct = (ext_m / (ext_m + ext_t) * 100) if (ext_m + ext_t) > 0 else 0
-
-            audit_log(f"  Entry: {ent_qty} @ ${ent_p:.8f} | Total: ${ent_qty*ent_p:.4f} | {ent_m}M/{ent_t}T ({ent_maker_pct:.1f}% Maker)")
-            audit_log(f"  Exit:  {ext_qty} @ ${ext_p:.8f} | Total: ${ext_qty*ext_p:.4f} | {ext_m}M/{ext_t}T ({ext_maker_pct:.1f}% Maker)")
-            audit_log(f"  Fees Paid: ${fees:.8f} {ent_a}")
-            audit_log(f"  Gross PNL (No Fees): ${gross_pnl:+.4f} USDT")
-            audit_log(f"  Net PNL (With Fees): ${net_pnl:+.4f} USDT")
+            audit_log(f"  Entry: {ent_qty} @ ${ent_p:.6f} | Total: ${ent_qty*ent_p:.2f} | Fee: ${ent_f:.6f} {ent_a}")
+            audit_log(f"  Exit:  {ext_qty} @ ${ext_p:.6f} | Total: ${ext_qty*ext_p:.2f} | Fee: ${ext_f:.6f} {ext_a}")
+            audit_log(f"  REALIZED PNL: ${realized_pnl:+.4f} USDT")
         
-    audit_log(f"\n💎 --- FINAL SUMMARY ---")
-    audit_log(f"💰 TOTAL GROSS PNL: ${total_gross_pnl:+.4f} USDT")
-    audit_log(f"💰 TOTAL FEES PAID: ${total_fee:.6f} USDT")
-    audit_log(f"💰 TOTAL NET PNL:   ${total_net_pnl:+.4f} USDT")
+    audit_log(f"\n� --- SUMMARY ---")
+    audit_log(f"💰 TOTAL FEES: ${total_fee:.6f} USDT")
+    audit_log(f"💰 COMBINED REALIZED PNL: {total_realized_pnl:+.4f} USDT")
     audit_log("="*100 + "\n")
 
 # =========================
@@ -1561,14 +1207,17 @@ async def main():
         
         binance_symbol = coin + "USDT"
         bybit_symbol = coin + "USDT"
-        binance_filters = get_binance_symbol_filters(binance_symbol)
-        bybit_filters = get_bybit_symbol_filters(bybit_symbol)
-
+        binance_step = get_binance_symbol_filters(binance_symbol)
+        bybit_step = get_bybit_symbol_filters(bybit_symbol)
+        
         # ✅ Validate filters
-        if not binance_filters or not bybit_filters:
+        if not binance_step or not bybit_step:
             print("❌ CRITICAL ERROR: Failed to fetch symbol filters!")
-            return
+            print("   Cannot place orders without proper step size and tick size.")
+            print("   Please check API connectivity and try again.")
+            return  # Exit function safely
 
+        print(f"📏 Binance stepSize: {binance_step}, Bybit qtyStep: {bybit_step}")
         
         while state.get("running", True):
             if "binance" in exchanges and "bybit" in exchanges:
@@ -1588,33 +1237,25 @@ async def main():
                             binance_set_leverage(binance_symbol, leverage)
                             bybit_set_leverage(bybit_symbol, leverage)
                             
-                            # ✅ TRUE USDT-NEUTRAL HEDGE (Using Entry Prices, NOT Mark Price)
+                            # ✅ TRUE USDT-NEUTRAL HEDGE
                             target_usdt = usdt * leverage
                             
-                            # Determine entry prices based on strategy (Bidding at the side we want to join)
-                            entry_p_b = state["binance"]["bid"] if sig["long"] == "binance" else state["binance"]["ask"]
-                            entry_p_y = state["bybit"]["bid"] if sig["long"] == "bybit" else state["bybit"]["ask"]
+                            # 1. Calculate Binance independently
+                            qty_b_ideal = target_usdt / state["binance"]["price"]
+                            pure_qty_b = round_step_size_nearest(qty_b_ideal, binance_step["step_size"])
+                            actual_usdt_b = pure_qty_b * state["binance"]["price"]
                             
-                            if entry_p_b <= 0 or entry_p_y <= 0:
-                                audit_log("⚠️ CRITICAL: Entry BBO is 0! WebSocket data lagging. Aborting execution.")
-                                return
-
-                            # 1. Calculate Binance quantity
-                            qty_b_ideal = target_usdt / entry_p_b
-                            pure_qty_b = round_step_size_nearest(qty_b_ideal, binance_filters["step_size"])
-                            actual_usdt_b = pure_qty_b * entry_p_b
-
-                            # 2. Calculate Bybit quantity
-                            qty_y_ideal = target_usdt / entry_p_y
-                            pure_qty_y = round_step_size(qty_y_ideal, bybit_filters["step_size"])
-                            actual_usdt_y = pure_qty_y * entry_p_y
+                            # 2. Calculate Bybit independently
+                            qty_y_ideal = target_usdt / state["bybit"]["price"]
+                            pure_qty_y = round_step_size(qty_y_ideal, bybit_step["step_size"])
+                            actual_usdt_y = pure_qty_y * state["bybit"]["price"]
                             
                             mismatch = actual_usdt_b - actual_usdt_y
                             
-                            audit_log(f"📐 USDT-Neutral Plan: Target=${target_usdt:.4f}")
-                            audit_log(f"🎯 Binance: {pure_qty_b} coins @ ${entry_p_b:.8f} (~${actual_usdt_b:.4f})")
-                            audit_log(f"🎯 Bybit:   {pure_qty_y} coins @ ${entry_p_y:.8f} (~${actual_usdt_y:.4f})")
-                            audit_log(f"⚖️ Parity Delta: ${abs(mismatch):.8f} (Using BBO, NOT Mark Price)")
+                            audit_log(f"📐 USDT-Neutral Search: Target=${target_usdt:.2f}")
+                            audit_log(f"🎯 Binance: {pure_qty_b} coins (~${actual_usdt_b:.4f})")
+                            audit_log(f"🎯 Bybit:   {pure_qty_y} coins (~${actual_usdt_y:.4f})")
+                            audit_log(f"⚖️ Parity Delta: ${abs(mismatch):.6f}")
                             
                             if pure_qty_b <= 0 or pure_qty_y <= 0:
                                 print("❌ Error: Calculated quantity is 0. Increase USDT or Leverage.")
@@ -1622,35 +1263,20 @@ async def main():
 
                             # Use Limit Order Chasing
                             # ... (task execution remains same) ...
-
-                            # 🆕 SHARED STATE FOR PERFECT PARITY
-                            shared_fill_state = {
-                                "binance": {"done": False, "filled_usdt": 0, "filled_qty": 0},
-                                "bybit": {"done": False, "filled_usdt": 0, "filled_qty": 0}
-                            }
-
-                             # Use Limit Order Chasing WITH SHARED STATE
                             tasks_chaser = []
                             if sig["long"] == "binance":
-                                tasks_chaser.append(limit_order_chaser("binance", binance_symbol, "BUY", pure_qty_b, state, binance_filters, trade_records, shared_fill_state))
+                                tasks_chaser.append(limit_order_chaser("binance", binance_symbol, "BUY", pure_qty_b, state, binance_step["step_size"], binance_step["tick_size"], trade_records))
                             else:
-                                tasks_chaser.append(limit_order_chaser("binance", binance_symbol, "SELL", pure_qty_b, state, binance_filters, trade_records, shared_fill_state))
-
+                                tasks_chaser.append(limit_order_chaser("binance", binance_symbol, "SELL", pure_qty_b, state, binance_step["step_size"], binance_step["tick_size"], trade_records))
+                            
                             if sig["long"] == "bybit":
-                                tasks_chaser.append(limit_order_chaser("bybit", bybit_symbol, "Buy", pure_qty_y, state, bybit_filters, trade_records, shared_fill_state))
+                                tasks_chaser.append(limit_order_chaser("bybit", bybit_symbol, "Buy", pure_qty_y, state, bybit_step["step_size"], bybit_step["tick_size"], trade_records))
                             else:
-                                tasks_chaser.append(limit_order_chaser("bybit", bybit_symbol, "Sell", pure_qty_y, state, bybit_filters, trade_records, shared_fill_state))                            
+                                tasks_chaser.append(limit_order_chaser("bybit", bybit_symbol, "Sell", pure_qty_y, state, bybit_step["step_size"], bybit_step["tick_size"], trade_records))
+                            
                             # Wait for both and log parity
-                            results = await asyncio.gather(*tasks_chaser)
-                            
-                            # results[0] is Binance, results[1] is Bybit
-                            actual_b_val = results[0][1]
-                            actual_y_val = results[1][1]
-                            actual_mismatch = abs(actual_b_val - actual_y_val)
-                            
-                            audit_log(f"SYSTEM ⚖️ HEDGE PARITY AUDIT: Actual Delta=${actual_mismatch:.8f}")
-                            if actual_mismatch > 2.0: # Alert if delta is significant (> $2)
-                                audit_log(f"⚠️ HIGH PARITY DELTA DETECTED: ${actual_mismatch:.2f}")
+                            await asyncio.gather(*tasks_chaser)
+                            audit_log(f"SYSTEM ⚖️ HEDGE PARITY AUDIT: Delta=${abs(mismatch):.6f}")
                             
                             # Store position sides
                             trade_records["binance"]["side"] = "LONG" if sig["long"] == "binance" else "SHORT"
@@ -1719,8 +1345,8 @@ async def main():
                 
         binance_symbol = coin + "USDT"
         bybit_symbol = coin + "USDT"
-        binance_filters = get_binance_symbol_filters(binance_symbol)
-        bybit_filters = get_bybit_symbol_filters(bybit_symbol)
+        binance_step = get_binance_symbol_filters(binance_symbol)
+        bybit_step = get_bybit_symbol_filters(bybit_symbol)
         
         while not trade_fired:
             await asyncio.sleep(1)  # Wait until trade is executed
@@ -1768,38 +1394,24 @@ async def main():
                     await asyncio.sleep(0.001)  # Check every 1ms with LIVE data (BG ONLY)
     
                 print(f"\n🚪 CLOSING ALL POSITIONS...")
-
-                # Execute BOTH at exact same millisecond
-                exit_tasks = []
-
+                
+                # Close Binance position
                 if "binance" in exchanges and position_info["binance"]["entry_price"]:
                     side_to_close = "SELL" if position_info["binance"]["side"] == "LONG" else "BUY"
                     qty = position_info["binance"]["size"]
                     print(f"Closing Binance {position_info['binance']['side']} with {side_to_close} order...")
-                    exit_tasks.append(asyncio.to_thread(
-                        binance_order, binance_symbol, side_to_close, qty, binance_filters["step_size"]
-                    ))
-                else:
-                    exit_tasks.append(asyncio.sleep(0))
-
+                    res = binance_order(binance_symbol, side_to_close, qty, binance_step["step_size"])
+                    if res.get("orderId"):
+                        trade_records["binance"]["exit_order_ids"].append(res.get("orderId"))
+                
+                # Close Bybit position
                 if "bybit" in exchanges and position_info["bybit"]["entry_price"]:
                     side_to_close = "Sell" if position_info["bybit"]["side"] == "Buy" else "Buy"
                     qty = position_info["bybit"]["size"]
                     print(f"Closing Bybit {position_info['bybit']['side']} with {side_to_close} order...")
-                    exit_tasks.append(asyncio.to_thread(
-                        bybit_order, bybit_symbol, side_to_close, qty, bybit_filters["step_size"]
-                    ))
-                else:
-                    exit_tasks.append(asyncio.sleep(0))
-
-                # 🚀 BOTH EXECUTE SIMULTANEOUSLY
-                results = await asyncio.gather(*exit_tasks)
-
-                # Store order IDs
-                if results[0] and isinstance(results[0], dict) and results[0].get("orderId"):
-                    trade_records["binance"]["exit_order_ids"].append(results[0]["orderId"])
-                if results[1] and isinstance(results[1], dict) and results[1].get("result", {}).get("orderId"):
-                    trade_records["bybit"]["exit_order_ids"].append(results[1]["result"]["orderId"])
+                    res = bybit_order(bybit_symbol, side_to_close, qty, bybit_step["step_size"])
+                    if res.get("result", {}).get("orderId"):
+                        trade_records["bybit"]["exit_order_ids"].append(res.get("result", {}).get("orderId"))
                 
                 exit_fired = True
                 audit_log("✅ All positions closed!")
@@ -1825,4 +1437,4 @@ async def main():
 # RUN
 # =========================
 if __name__ == "__main__":
-    asyncio.run(main())    
+    asyncio.run(main())
