@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_DOWN
 import ntplib
 from datetime import datetime
 import math
+import threading
 
 # =========================
 # TIME SYNC CORRECTION
@@ -1325,8 +1326,6 @@ async def limit_order_exit_chaser_v3(exchange, symbol, side, state, filters, tra
                     binance_cancel_order(symbol, active_order_id)
                 else:
                     bybit_cancel_order(symbol, active_order_id)
-                
-                await asyncio.sleep(0.1)
                 
                 # 🆕 After cancel, update cumulative fills
                 if exchange == "binance":
